@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var("ORT_DYLIB_PATH", &args.ort_dylib_path);
 
     // read the image
-    let image: Image<u8, 3> = F::read_image_any_rgb8(&args.image_path)?;
+    let image = F::read_image_any_rgb8(&args.image_path)?;
 
     // read the onnx model
 
@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .commit_from_file(&args.onnx_model_path)?;
 
     // cast and scale the image to f32
-    let mut image_hwc_f32 = Image::from_size_val(image.size(), 0.0f32)?;
+    let mut image_hwc_f32 = Image::from_size_val(image.size(), 0.0f32, CpuAllocator)?;
     kornia::image::ops::cast_and_scale(&image, &mut image_hwc_f32, 1.0 / 255.0)?;
 
     // convert to HWC -> CHW
