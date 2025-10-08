@@ -2,9 +2,13 @@
 //! Paper: [Lepetit et al., IJCV 2009](https://www.tugraz.at/fileadmin/user_upload/Institute/ICG/Images/team_lepetit/publications/lepetit_ijcv08.pdf)
 //! Reference: [OpenCV EPnP implementation](https://github.com/opencv/opencv/blob/4.x/modules/calib3d/src/epnp.cpp)
 
-use crate::ops::{compute_centroid, gauss_newton};
+use crate::ops::{compute_centroid, gauss_newton, intrinsics_as_vectors, pose_to_rt};
 use crate::pnp::{NumericTol, PnPError, PnPResult, PnPSolver};
 use glam::{Mat3, Mat3A, Vec3};
+use kornia_imgproc::calibration::{
+    distortion::{distort_point_polynomial, PolynomialDistortion},
+    CameraIntrinsic,
+};
 use kornia_lie::so3::SO3;
 use kornia_linalg::rigid::umeyama;
 use kornia_linalg::svd::svd3;
@@ -20,9 +24,10 @@ impl PnPSolver for EPnP {
         points_world: &[[f32; 3]],
         points_image: &[[f32; 2]],
         k: &[[f32; 3]; 3],
+        distortion: Option<&PolynomialDistortion>,
         params: &Self::Param,
     ) -> Result<PnPResult, PnPError> {
-        solve_epnp(points_world, points_image, k, params)
+        solve_epnp(points_world, points_image, k, distortion, params)
     }
 }
 
@@ -49,6 +54,7 @@ pub fn solve_epnp(
     points_world: &[[f32; 3]],
     points_image: &[[f32; 2]],
     k: &[[f32; 3]; 3],
+    distortion: Option<&PolynomialDistortion>,
     params: &EPnPParams,
 ) -> Result<PnPResult, PnPError> {
     let n = points_world.len();
@@ -77,14 +83,23 @@ pub fn solve_epnp(
     let m_flat: Vec<f32> = m_rows.iter().flat_map(|row| row.iter()).cloned().collect();
     let m_mat = DMatrix::<f32>::from_row_slice(2 * n, 12, &m_flat);
 
-    // Null-space of M (4 right-singular vectors associated with smallest singular values)
-    let svd = m_mat.svd(true, true);
-    let Some(v_t) = svd.v_t else {
-        return Err(PnPError::SvdFailed("Failed to compute V^T".to_string()));
+    // Null-space of M via SVD of MtM (12×12), following OpenCV epnp.cpp
+    let mtm = m_mat.transpose() * &m_mat; // 12×12
+    let svd = mtm.svd(true, true);
+    let Some(u) = svd.u else {
+        return Err(PnPError::SvdFailed(
+            "Failed to compute U for MtM".to_string(),
+        ));
     };
-    let cols = 12;
+    // Take the last 4 columns of U (smallest singular values)
+    let cols = u.ncols();
+    if cols < 4 {
+        return Err(PnPError::SvdFailed(
+            "U has fewer than 4 columns".to_string(),
+        ));
+    }
     let start_col = cols - 4;
-    let null4 = v_t.rows(start_col, 4).transpose(); // shape 12×4
+    let null4 = u.columns(start_col, 4).into_owned(); // 12×4
 
     // Build helper matrices for beta initialisation
     let l = build_l6x10(&null4);
@@ -116,7 +131,7 @@ pub fn solve_epnp(
 
     for bet in &betas_refined {
         let (r_c, t_c) = pose_from_betas(bet, &null4, &cw, &alphas)?;
-        let err = rmse_px(points_world, points_image, &r_c, &t_c, k)?;
+        let err = rmse_px(points_world, points_image, &r_c, &t_c, k, distortion)?;
         if err < best_err {
             best_err = err;
             best_r = r_c;
@@ -195,6 +210,7 @@ fn rmse_px(
     r: &[[f32; 3]; 3],
     t: &[f32; 3],
     k: &[[f32; 3]; 3],
+    distortion: Option<&PolynomialDistortion>,
 ) -> Result<f32, PnPError> {
     if points_world.len() != points_image.len() {
         return Err(PnPError::MismatchedArrayLengths {
@@ -210,28 +226,35 @@ fn rmse_px(
     let cx = k[0][2];
     let cy = k[1][2];
 
-    // Pre-compute matrix and vectors in glam form for SIMD-friendly ops
-    let r_mat = Mat3::from_cols(
-        Vec3::new(r[0][0], r[1][0], r[2][0]),
-        Vec3::new(r[0][1], r[1][1], r[2][1]),
-        Vec3::new(r[0][2], r[1][2], r[2][2]),
-    );
-    let t_vec = Vec3::new(t[0], t[1], t[2]);
-
-    // Pack intrinsics so that (intr_x ⋅ Pc) / z = fx * x / z + cx
-    let intr_x = Vec3::new(fx, 0.0, cx);
-    let intr_y = Vec3::new(0.0, fy, cy);
+    let (r_mat, t_vec) = pose_to_rt(r, t);
+    let (intr_x, intr_y) = intrinsics_as_vectors(k);
 
     let mut sum_sq = 0.0;
     let n = points_world.len() as f32;
+
+    // Prepare camera intrinsic for distortion if needed
+    let cam_intr = CameraIntrinsic {
+        fx: fx as f64,
+        fy: fy as f64,
+        cx: cx as f64,
+        cy: cy as f64,
+    };
 
     for (pw_arr, &uv) in points_world.iter().zip(points_image.iter()) {
         let pw = Vec3::from_array(*pw_arr);
         let pc = r_mat * pw + t_vec; // camera-frame point
 
         let inv_z = 1.0 / pc.z;
-        let u_hat = intr_x.dot(pc) * inv_z; // (fx * x + cx * z) / z
-        let v_hat = intr_y.dot(pc) * inv_z; // (fy * y + cy * z) / z
+        let u_undist = intr_x.dot(pc) * inv_z; // (fx * x + cx * z) / z
+        let v_undist = intr_y.dot(pc) * inv_z; // (fy * y + cy * z) / z
+
+        // Apply distortion model if provided
+        let (u_hat, v_hat) = if let Some(d) = distortion {
+            let (ud, vd) = distort_point_polynomial(u_undist as f64, v_undist as f64, &cam_intr, d);
+            (ud as f32, vd as f32)
+        } else {
+            (u_undist, v_undist)
+        };
 
         let du = u_hat - uv[0];
         let dv = v_hat - uv[1];
@@ -614,7 +637,13 @@ mod solve_epnp_tests {
             assert_relative_eq!(m[1][k], expected_y[k], epsilon = 1e-9);
         }
 
-        let result = EPnP::solve(&points_world, &points_image, &k, &EPnPParams::default())?;
+        let result = EPnP::solve(
+            &points_world,
+            &points_image,
+            &k,
+            None,
+            &EPnPParams::default(),
+        )?;
         let r = result.rotation;
         let t = result.translation;
         let rvec = result.rvec;
