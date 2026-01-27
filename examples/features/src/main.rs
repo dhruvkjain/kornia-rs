@@ -38,8 +38,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // preallocate images
     let mut img_f32 = Image::from_size_val(size, 0f32, CpuAllocator)?;
     let mut gray = Image::from_size_val(size, 0f32, CpuAllocator)?;
-    let mut hessian = Image::from_size_val(size, 0f32, CpuAllocator)?;
-    let mut corners = Image::from_size_val(size, 0f32, CpuAllocator)?;
+    let mut hessian_response = Image::from_size_val(size, 0f32, CpuAllocator)?;
+    let mut hessian_corners = Image::from_size_val(size, 0f32, CpuAllocator)?;
+    let mut gftt_response = Image::from_size_val(size, 0f32, CpuAllocator)?;
+    let mut gftt_corners = Image::from_size_val(size, 0f32, CpuAllocator)?;
 
     // start grabbing frames from the camera
     while !cancel_token.load(Ordering::SeqCst) {
@@ -52,10 +54,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         imgproc::color::gray_from_rgb(&img_f32, &mut gray)?;
 
         // compute the hessian response
-        imgproc::features::hessian_response(&gray, &mut hessian)?;
+        imgproc::features::hessian_response(&gray, &mut hessian_response)?;
+        imgproc::threshold::threshold_binary(&hessian_response, &mut hessian_corners, 0.01, 1.0)?;
 
-        // compute the corners
-        imgproc::threshold::threshold_binary(&hessian, &mut corners, 0.01, 1.0)?;
+        // compute the gftt response
+        imgproc::features::gftt_response(&gray, &mut gftt_response)?;
+        imgproc::threshold::threshold_binary(&gftt_response, &mut gftt_corners, 0.01, 1.0)?;
 
         // log the image
         rec.log_static(
@@ -63,12 +67,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &rerun::Image::from_elements(img.as_slice(), img.size().into(), rerun::ColorModel::RGB),
         )?;
 
-        // log the corners
+        // log the hessian corners
         rec.log_static(
-            "corners",
+            "corners/hessian",
             &rerun::Image::from_elements(
-                corners.as_slice(),
-                corners.size().into(),
+                hessian_corners.as_slice(),
+                hessian_corners.size().into(),
+                rerun::ColorModel::L,
+            ),
+        )?;
+
+        // log the gftt corners
+        rec.log_static(
+            "corners/gftt",
+            &rerun::Image::from_elements(
+                gftt_corners.as_slice(),
+                gftt_corners.size().into(),
                 rerun::ColorModel::L,
             ),
         )?;

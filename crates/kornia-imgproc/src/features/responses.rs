@@ -332,6 +332,171 @@ pub fn dog_response<A1: ImageAllocator, A2: ImageAllocator>(
     Ok(())
 }
 
+/// Compute the GFTT response of an image.
+///
+/// The GFTT response is the smaller eigenvalue of the structure tensor, used in Good Features to Track.
+///
+/// The response is calculated as:
+///
+/// Response = \lambda_{min}
+///
+/// where \lambda_{min} is the smaller eigenvalue of the structure tensor M:
+///
+/// M = | \sum(I_x^2)  \sum(I_x I_y) |
+///     | \sum(I_x I_y)  \sum(I_y^2) |
+///
+/// The sums are performed over a 3x3 window. The gradients I_x and I_y are computed using a 3x3 Sobel operator.
+///
+/// Args:
+///     src: The source image with shape (H, W).
+///     dst: The destination image with shape (H, W).
+pub fn gftt_response<A1: ImageAllocator, A2: ImageAllocator>(
+    src: &Image<f32, 1, A1>,
+    dst: &mut Image<f32, 1, A2>,
+) -> Result<(), ImageError> {
+    if src.size() != dst.size() {
+        return Err(ImageError::InvalidImageSize(
+            src.cols(),
+            src.rows(),
+            dst.cols(),
+            dst.rows(),
+        ));
+    }
+
+    let image_size = src.size();
+    let mut dx2_data = vec![0.0; image_size.width * image_size.height];
+    let mut dy2_data = vec![0.0; image_size.width * image_size.height];
+    let mut dxy_data = vec![0.0; image_size.width * image_size.height];
+
+    let src_data = src.as_slice();
+    let col_slice = src.cols()..src_data.len() - src.cols();
+    let row_slice = 1..src.cols() - 1;
+
+    dx2_data
+        .as_mut_slice()
+        .get_mut(col_slice.clone())
+        // SAFETY: we ranges is valid
+        .unwrap()
+        .par_chunks_exact_mut(src.cols())
+        .zip(
+            dy2_data
+                .as_mut_slice()
+                .get_mut(col_slice.clone())
+                // SAFETY: we ranges is valid
+                .unwrap()
+                .par_chunks_exact_mut(src.cols()),
+        )
+        .zip(
+            dxy_data
+                .as_mut_slice()
+                .get_mut(col_slice.clone())
+                // SAFETY: we ranges is valid
+                .unwrap()
+                .par_chunks_exact_mut(src.cols()),
+        )
+        .enumerate()
+        .for_each(|(row_idx, ((dx2_chunk, dy2_chunk), dxy_chunk))| {
+            let row_offset = (row_idx + 1) * src.cols();
+
+            dx2_chunk
+                .get_mut(row_slice.clone())
+                // SAFETY: we ranges is valid
+                .unwrap()
+                .iter_mut()
+                .zip(
+                    dy2_chunk
+                        .get_mut(row_slice.clone())
+                        // SAFETY: we ranges is valid
+                        .unwrap()
+                        .iter_mut(),
+                )
+                .zip(dxy_chunk.get_mut(row_slice.clone()).unwrap().iter_mut())
+                .enumerate()
+                .for_each(|(col_idx, ((dx2_pixel, dy2_pixel), dxy_pixel))| {
+                    let current_idx = row_offset + col_idx + 1;
+                    let prev_row_idx = current_idx - src.cols();
+                    let next_row_idx = current_idx + src.cols();
+
+                    let (v11, v12, v13, v21, v23, v31, v32, v33) = unsafe {
+                        // SAFETY: we ranges is valid
+                        (
+                            src_data.get_unchecked(prev_row_idx - 1),
+                            src_data.get_unchecked(prev_row_idx),
+                            src_data.get_unchecked(prev_row_idx + 1),
+                            src_data.get_unchecked(current_idx - 1),
+                            src_data.get_unchecked(current_idx + 1),
+                            src_data.get_unchecked(next_row_idx - 1),
+                            src_data.get_unchecked(next_row_idx),
+                            src_data.get_unchecked(next_row_idx + 1),
+                        )
+                    };
+
+                    // I_x,I_y via 3x3 sobel operator and convolved
+                    let dx = (-v33 + v31 - 2.0 * v23 + 2.0 * v21 - v13 + v11) * 0.125;
+                    let dy = (-v33 - 2.0 * v32 - v31 + v13 + 2.0 * v12 + v11) * 0.125;
+
+                    // filter normalization
+                    *dx2_pixel = dx * dx;
+                    *dy2_pixel = dy * dy;
+                    *dxy_pixel = dx * dy;
+                });
+        });
+
+    dst.as_slice_mut()
+        .get_mut(col_slice.clone())
+        // SAFETY: we ranges is valid
+        .unwrap()
+        .par_chunks_exact_mut(src.cols())
+        .enumerate()
+        .for_each(|(row_idx, dst_chunk)| {
+            let row_offset = (row_idx + 1) * src.cols();
+
+            dst_chunk
+                .get_mut(row_slice.clone())
+                // SAFETY: we ranges is valid
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+                .for_each(|(col_idx, dst_pixel)| {
+                    let current_idx = row_offset + col_idx + 1;
+                    let prev_row_idx = current_idx - src.cols();
+                    let next_row_idx = current_idx + src.cols();
+
+                    let mut m11 = 0.0;
+                    let mut m22 = 0.0;
+                    let mut m12 = 0.0;
+
+                    let idxs = [
+                        prev_row_idx - 1,
+                        prev_row_idx,
+                        prev_row_idx + 1,
+                        current_idx - 1,
+                        current_idx,
+                        current_idx + 1,
+                        next_row_idx - 1,
+                        next_row_idx,
+                        next_row_idx + 1,
+                    ];
+                    for idx in idxs {
+                        // SAFETY: we ranges is valid
+                        unsafe {
+                            m11 += dx2_data.get_unchecked(idx);
+                            m22 += dy2_data.get_unchecked(idx);
+                            m12 += dxy_data.get_unchecked(idx);
+                        }
+                    }
+
+                    let trace = m11 + m22;
+                    let discriminant_sqrt = (m11 - m22).mul_add(m11 - m22, 4.0 * m12 * m12).sqrt();
+                    let min_eigenvalue = (trace - discriminant_sqrt) / 2.0;
+
+                    *dst_pixel = f32::max(0.0, min_eigenvalue);
+                });
+        });
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +692,44 @@ mod tests {
             "Sum of DoG response should be close to expected value"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_gftt_response() -> Result<(), ImageError> {
+        #[rustfmt::skip]
+        let src = Image::from_size_slice(
+            [9, 9].into(),
+            &[
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            CpuAllocator
+        )?;
+
+        let mut dst = Image::from_size_val([9, 9].into(), 0.0, CpuAllocator)?;
+        gftt_response(&src, &mut dst)?;
+
+        assert_eq!(
+            dst.as_slice(),
+            &[
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0625, 0.20894662, 0.12582296,
+                0.0, 0.12582296, 0.20894662, 0.0625, 0.0, 0.0, 0.20894662, 0.5625, 0.36776417, 0.0,
+                0.36776417, 0.5625, 0.20894662, 0.0, 0.0, 0.12582296, 0.36776417, 0.5, 0.0, 0.5,
+                0.36776417, 0.12582296, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.12582296, 0.36776417, 0.5, 0.0, 0.5, 0.36776417, 0.12582296, 0.0, 0.0,
+                0.20894662, 0.5625, 0.36776417, 0.0, 0.36776417, 0.5625, 0.20894662, 0.0, 0.0,
+                0.0625, 0.20894662, 0.12582296, 0.0, 0.12582296, 0.20894662, 0.0625, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            ]
+        );
         Ok(())
     }
 }
